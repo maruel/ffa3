@@ -16,7 +16,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"periph.io/x/conn/v3/physic"
@@ -27,6 +26,8 @@ type Position struct {
 	X physic.Distance
 	Y physic.Distance
 	Z physic.Distance
+	A int
+	B int
 	_ struct{}
 }
 
@@ -65,20 +66,19 @@ type Status struct {
 
 // Found is a printer found on the network.
 type Found struct {
-	IP   net.Addr
+	IP   net.IP
 	Name string
 	_    struct{}
 }
 
 func (f *Found) String() string {
-	// TODO(maruel): Resolve IP address.
-	return fmt.Sprintf("%s: %s", f.Name, f.IP)
+	return fmt.Sprintf("%s (%s)", f.Name, f.IP)
 }
 
 // Search searches for printers via UDP discovery.
 //
 // It does so by sending bytes to a predetermined multicast IP address.
-func Search() ([]Found, error) {
+func Search(first bool, d time.Duration) ([]Found, error) {
 	// Magic multicast IP the FlashForge Adventurer 3 is listening to.
 	const ip = "225.0.0.9:19000"
 	raddr, err := net.ResolveUDPAddr("udp4", ip)
@@ -98,11 +98,14 @@ func Search() ([]Found, error) {
 	log.Printf("Listening on: %s", laddr)
 	b := [1024]byte{}
 	l.SetReadBuffer(len(b))
+
+	// Read loop.
 	var out []Found
-	wg := sync.WaitGroup{}
-	wg.Add(1)
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer func() {
+			done <- struct{}{}
+		}()
 		for {
 			n, src, err := l.ReadFromUDP(b[:])
 			log.Printf("ReadFromUDP() = %v, %v, %v", n, src, err)
@@ -112,7 +115,10 @@ func Search() ([]Found, error) {
 			}
 			// TODO(maruel): It's a 140 bytes packet. Figure out the format.
 			if i := bytes.IndexByte(b[:n], 0); i != -1 {
-				out = append(out, Found{IP: src, Name: string(b[:i])})
+				out = append(out, Found{IP: src.IP, Name: string(b[:i])})
+			}
+			if first {
+				return
 			}
 		}
 	}()
@@ -125,13 +131,17 @@ func Search() ([]Found, error) {
 	log.Printf("Magic: %x", magic)
 	if _, err := l.WriteTo(magic[:], raddr); err != nil {
 		l.Close()
-		wg.Wait()
+		<-done
 		return nil, fmt.Errorf("failed to write magic packet: %w", err)
 	}
 
-	time.Sleep(100*time.Millisecond)
-	err = l.Close()
-	wg.Wait()
+	select {
+	case <-time.After(d):
+		err = l.Close()
+		<-done
+	case <-done:
+		err = l.Close()
+	}
 	return out, err
 }
 
@@ -167,6 +177,8 @@ func (d *Dev) Close() error {
 	return err2
 }
 
+// Query
+
 // QueryPrinterInfo queries the printer information. This should never change so
 // it can be safely cached.
 func (d *Dev) QueryPrinterInfo(i *Info) error {
@@ -186,24 +198,24 @@ func (d *Dev) QueryPrinterInfo(i *Info) error {
 		case strings.HasPrefix(line, "SN: "):
 			i.Serial = line[len("SN: "):]
 		case strings.HasPrefix(line, "X: "):
-			r := regexp.MustCompile(`X: (\d+) Y: (\d+) Z: (\d+)`)
-			if m := r.FindStringSubmatch(line); m != nil {
-				v, err := strconv.Atoi(m[1])
-				if err != nil {
-					return err
-				}
-				i.X = physic.MilliMetre * physic.Distance(v)
-				if v, err = strconv.Atoi(m[2]); err != nil {
-					return err
-				}
-				i.Y = physic.MilliMetre * physic.Distance(v)
-				if v, err = strconv.Atoi(m[3]); err != nil {
-					return err
-				}
-				i.Z = physic.MilliMetre * physic.Distance(v)
-				break
+			re := regexp.MustCompile(`^X: (\d+) Y: (\d+) Z: (\d+)$`)
+			m := re.FindStringSubmatch(line)
+			if m == nil {
+				return fmt.Errorf("unknown reply: %q", line)
 			}
-			return fmt.Errorf("unknown M115 reply: %q", line)
+			v, err := strconv.Atoi(m[1])
+			if err != nil {
+				return err
+			}
+			i.X = physic.MilliMetre * physic.Distance(v)
+			if v, err = strconv.Atoi(m[2]); err != nil {
+				return err
+			}
+			i.Y = physic.MilliMetre * physic.Distance(v)
+			if v, err = strconv.Atoi(m[3]); err != nil {
+				return err
+			}
+			i.Z = physic.MilliMetre * physic.Distance(v)
 		case strings.HasPrefix(line, "Tool Count: "):
 			if i.ExtruderCount, err = strconv.Atoi(line[len("Tool Count: "):]); err != nil {
 				return err
@@ -214,11 +226,50 @@ func (d *Dev) QueryPrinterInfo(i *Info) error {
 		case line == "ok":
 		case line == "":
 		default:
-			return fmt.Errorf("unknown M115 reply: %q", line)
+			return fmt.Errorf("unknown reply: %q", line)
 		}
 	}
 	return nil
 }
+
+// QueryPosition returns the extruder position.
+func (d *Dev) QueryPosition(p *Position) error {
+	resp, err := d.sendCommand("M114")
+	if err != nil {
+		return err
+	}
+	re := regexp.MustCompile(`^X:(-?[\d.]+) Y:(-?[\d.]+) Z:(-?[\d.]+) A:(\d+) B:(\d+)$`)
+	m := re.FindStringSubmatch(resp)
+	if m == nil {
+		return fmt.Errorf("unknown reply: %q", resp)
+	}
+	// TODO(maruel): Handle dot. It seems that the printer handlers this as a
+	// float but I'd prefer to handle as integer here.
+	v, err := strconv.Atoi(m[1])
+	if err != nil {
+		return err
+	}
+	p.X = physic.MilliMetre * physic.Distance(v)
+	if v, err = strconv.Atoi(m[2]); err != nil {
+		return err
+	}
+	p.Y = physic.MilliMetre * physic.Distance(v)
+	if v, err = strconv.Atoi(m[3]); err != nil {
+		return err
+	}
+	p.Z = physic.MilliMetre * physic.Distance(v)
+	if v, err = strconv.Atoi(m[4]); err != nil {
+		return err
+	}
+	p.A = v
+	if v, err = strconv.Atoi(m[5]); err != nil {
+		return err
+	}
+	p.B = v
+	return nil
+}
+
+// Commands
 
 // SetLight turns the printer's light on or off.
 func (d *Dev) SetLight(on bool) error {
@@ -228,8 +279,8 @@ func (d *Dev) SetLight(on bool) error {
 		cmd = "M146 r255 g255 b255 F0"
 	}
 	resp, err := d.sendCommand(cmd)
-	if resp != "CMD M146 Received.\r\nok\r\n" {
-		return fmt.Errorf("unknown M146 reply: %q", resp)
+	if resp != "" {
+		return fmt.Errorf("unknown reply: %q", resp)
 	}
 	return err
 }
@@ -237,11 +288,15 @@ func (d *Dev) SetLight(on bool) error {
 // SetFan turns the printer's fan on or off.
 func (d *Dev) SetFan(on bool) error {
 	// TODO(maruel): It turns back on right after!
-	cmd := "M107"
+	// TODO(maruel): Doesn't work.
+	cmd := "M107 P0"
 	if on {
-		cmd = "M106 P1 S255"
+		cmd = "M106 P0 S255"
 	}
-	_, err := d.sendCommand(cmd)
+	resp, err := d.sendCommand(cmd)
+	if resp != "" {
+		return fmt.Errorf("unknown reply: %q", resp)
+	}
 	return err
 }
 
@@ -306,16 +361,9 @@ func (d *Dev) QueryJob() error {
 	// "SD printing byte X/Y"
 	return nil
 }
-
-func (d *Dev) QueryPosition() error {
-	_, err := d.sendCommand("M114")
-	if err != nil {
-		return err
-	}
-	// "ok C: X:0.00 Y:0.00 Z:0.00 E:0.00"
-	return nil
-}
 */
+
+// Internal
 
 // sendHello sends an hello command that must be the first command sent.
 func (d *Dev) sendHello() error {
@@ -375,6 +423,9 @@ func (d *Dev) sendCommand(cmd string) (string, error) {
 	}
 	// Trim the wrap. Create a copy to not keep unneeded data in memory.
 	line := string(resp[len(prefix) : len(resp)-len("ok\r\n")])
+	if strings.HasSuffix(line, "\r\n") {
+		line = line[:len(line)-len("\r\n")]
+	}
 	log.Printf("sendCommand(%q): %q", cmd, line)
 	return line, nil
 }

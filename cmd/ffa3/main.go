@@ -18,6 +18,54 @@ import (
 	"github.com/maruel/ffa3"
 )
 
+func play(d *ffa3.Dev) error {
+	i := ffa3.Info{}
+	if err := d.QueryPrinterInfo(&i); err != nil {
+		return err
+	}
+	fmt.Printf("Printer info: %# v\n", &i)
+	p := ffa3.Position{}
+	if err := d.QueryPosition(&p); err != nil {
+		return err
+	}
+	fmt.Printf("Extruder position: %# v\n", &p)
+
+	/*
+		fmt.Printf("LED off\n")
+		if err := d.SetLight(false); err != nil {
+			return err
+		}
+		time.Sleep(time.Second)
+
+		fmt.Printf("LED on\n")
+		if err := d.SetLight(true); err != nil {
+			return err
+		}
+		time.Sleep(time.Second)
+	*/
+
+	/*
+		fmt.Printf("Fan off\n")
+		if err := d.SetFan(false); err != nil {
+			return err
+		}
+		time.Sleep(time.Second)
+
+		fmt.Printf("Fan on\n")
+		if err := d.SetFan(true); err != nil {
+			return err
+		}
+		time.Sleep(4 * time.Second)
+
+		fmt.Printf("Fan off\n")
+		if err := d.SetFan(false); err != nil {
+			return err
+		}
+		time.Sleep(time.Second)
+	*/
+	return nil
+}
+
 func mainImpl() error {
 	ip := flag.String("ip", "", "Printer IP; by default a search is done but it takes one second")
 	verbose := flag.Bool("v", false, "verbose")
@@ -29,13 +77,15 @@ func mainImpl() error {
 	}
 
 	if *ip == "" {
-		f, err := ffa3.Search()
+		f, err := ffa3.Search(true, time.Second)
 		if err != nil {
 			return err
 		}
 		if len(f) == 0 {
 			return errors.New("no printer found on network")
 		}
+		// This will not happen since we specify first=true above. Leaving
+		// the code as a safety gap in case I want to change first flag above.
 		if len(f) > 1 {
 			var s []string
 			for _, l := range f {
@@ -44,37 +94,19 @@ func mainImpl() error {
 			sort.Strings(s)
 			return fmt.Errorf("more than one printer found on network; specify which one you want:\n%s", strings.Join(s, "\n"))
 		}
-		log.Printf("Using printer %s", f[0])
+		log.Printf("Using printer: %s", f[0].String())
 		*ip = f[0].IP.String()
 	}
-	return nil
+
 	d, err := ffa3.Connect(*ip)
 	if err != nil {
 		return err
 	}
-	i := ffa3.Info{}
-	if err := d.QueryPrinterInfo(&i); err != nil {
-		return err
+	err = play(d)
+	if err2 := d.Close(); err == nil {
+		err = err2
 	}
-	fmt.Printf("Printer info: %# v\n", i)
-
-	/*
-		if err := d.SetLight(true); err != nil {
-			return err
-		}
-		if err := d.SetFan(true); err != nil {
-			return err
-		}
-		time.Sleep(time.Second)
-	*/
-	if err := d.SetLight(false); err != nil {
-		return err
-	}
-	if err := d.SetFan(false); err != nil {
-		return err
-	}
-	time.Sleep(time.Second)
-	return d.Close()
+	return err
 }
 
 func main() {
