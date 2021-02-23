@@ -222,8 +222,6 @@ func (d *Dev) QueryPrinterInfo(i *Info) error {
 			}
 		case strings.HasPrefix(line, "Mac Address: "):
 			i.MacAddr = line[len("Mac Address: "):]
-		case line == "CMD M115 Received.":
-		case line == "ok":
 		case line == "":
 		default:
 			return fmt.Errorf("unknown reply: %q", line)
@@ -232,41 +230,92 @@ func (d *Dev) QueryPrinterInfo(i *Info) error {
 	return nil
 }
 
-// QueryPosition returns the extruder position.
-func (d *Dev) QueryPosition(p *Position) error {
+// QueryStatus returns the current printer status.
+func (d *Dev) QueryStatus(s *Status) error {
+	resp, err := d.sendCommand("M119")
+	if err != nil {
+		return err
+	}
+	// TODO(maruel): Implement.
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case line == "Endstop: X-max:0 Y-max:0 Z-max:0":
+		case strings.HasPrefix(line, "MachineStatus: "):
+			// PAUSED
+		case strings.HasPrefix(line, "MoveMode: "):
+			// PAUSED
+		case line == "Status: S:0 L:0 J:0 F:0":
+		default:
+			return fmt.Errorf("unknown reply: %q", line)
+		}
+	}
+	return nil
+}
+
+// QueryExtruderPosition returns the current extruder position.
+func (d *Dev) QueryExtruderPosition(p *Position) error {
 	resp, err := d.sendCommand("M114")
 	if err != nil {
 		return err
 	}
-	re := regexp.MustCompile(`^X:(-?[\d.]+) Y:(-?[\d.]+) Z:(-?[\d.]+) A:(\d+) B:(\d+)$`)
+	re := regexp.MustCompile(`^X:(\-?\d+(?:\.\d+)) Y:(\-?\d+(?:\.\d+)) Z:(\-?\d+(?:\.\d+)) A:(\d+) B:(\d+)$`)
 	m := re.FindStringSubmatch(resp)
 	if m == nil {
 		return fmt.Errorf("unknown reply: %q", resp)
 	}
-	// TODO(maruel): Handle dot. It seems that the printer handlers this as a
-	// float but I'd prefer to handle as integer here.
-	v, err := strconv.Atoi(m[1])
+	v, err := parseDistance(m[1])
 	if err != nil {
 		return err
 	}
-	p.X = physic.MilliMetre * physic.Distance(v)
-	if v, err = strconv.Atoi(m[2]); err != nil {
+	p.X = v
+
+	if v, err = parseDistance(m[2]); err != nil {
 		return err
 	}
-	p.Y = physic.MilliMetre * physic.Distance(v)
-	if v, err = strconv.Atoi(m[3]); err != nil {
+	p.Y = v
+
+	if v, err = parseDistance(m[3]); err != nil {
 		return err
 	}
-	p.Z = physic.MilliMetre * physic.Distance(v)
-	if v, err = strconv.Atoi(m[4]); err != nil {
+	p.Z = v
+
+	w, err := strconv.Atoi(m[4])
+	if err != nil {
 		return err
 	}
-	p.A = v
-	if v, err = strconv.Atoi(m[5]); err != nil {
+	p.A = w
+	if w, err = strconv.Atoi(m[5]); err != nil {
 		return err
 	}
-	p.B = v
+	p.B = w
 	return nil
+}
+
+// QueryTemp queries the temperatures.
+func (d *Dev) QueryTemp(t *Temperatures) error {
+	resp, err := d.sendCommand("M105")
+	if err != nil {
+		return err
+	}
+	// TODO(maruel): Parse.
+	re := regexp.MustCompile(`^T(\d+):(\d+) /(\d+) B:(\d+)/(\d+)$`)
+	m := re.FindStringSubmatch(resp)
+	if m == nil {
+		return fmt.Errorf("unknown reply: %q", resp)
+	}
+	return nil
+}
+
+// QueryJobStatus returns the current job status.
+func (d *Dev) QueryJobStatus() (string, error) {
+	// M27 S2 reports every 2 seconds.
+	resp, err := d.sendCommand("M27")
+	if err != nil {
+		return "", err
+	}
+	// "SD printing byte 0/100"
+	return resp, nil
 }
 
 // Commands
@@ -300,68 +349,19 @@ func (d *Dev) SetFan(on bool) error {
 	return err
 }
 
-/*
 // StopJob stops the running job.
 func (d *Dev) StopJob() error {
-	_, err := d.sendCommand("M26")
-	return err
-}
-
-// PauseJob pauses the running job.
-func (d *Dev) PauseJob() error {
-	// S1 not needed?
-	_, err := d.sendCommand("M601 S1")
-	return err
-}
-
-// ResumeJob pauses the running job.
-func (d *Dev) ResumeJob() error {
-	_, err := d.sendCommand("M602")
-	return err
-}
-
-// StopJob stops the running job but doesn't affect other parameters like
-// heating.
-func (d *Dev) StopJob() error {
-	_, err := d.sendCommand("M603")
-	return err
-}
-
-// FullStop stops everything right now.
-func (d *Dev) FullStop() error {
-	_, err := d.sendCommand("M112")
-	return err
-}
-
-func (d *Dev) QueryStatus() error {
-	_, err := d.sendCommand("M119")
-	if err != nil {
-		return err
+	resp, err := d.sendCommand("M26")
+	if resp != "" {
+		return fmt.Errorf("unknown reply: %q", resp)
 	}
-	return nil
+	return err
 }
 
-// QueryTemp queries the temperatures.
-func (d *Dev) QueryTemp(t *Temperatures) error {
-	_, err := d.sendCommand("M105")
-	if err != nil {
-		return err
-	}
-	// "ok T:201 B:117" or more complicated.
-	return nil
+// SendRawCommand sends a raw command, returns the trimmed response.
+func (d *Dev) SendRawCommand(cmd string) (string, error) {
+	return d.sendCommand(cmd)
 }
-
-func (d *Dev) QueryJob() error {
-	// M27 S2 reports every 2 seconds.
-	_, err := d.sendCommand("M27")
-	if err != nil {
-		return err
-	}
-	// "Not SD printing."
-	// "SD printing byte X/Y"
-	return nil
-}
-*/
 
 // Internal
 
@@ -395,6 +395,7 @@ func (d *Dev) sendBye() error {
 // sendCommand sends a command, returns the trimmed response.
 func (d *Dev) sendCommand(cmd string) (string, error) {
 	// "~" is required, "\r\n" is not, "\n" is sufficient.
+	//log.Printf("sendCommand(%q)", cmd)
 	if _, err := d.conn.Write([]byte("~" + cmd + "\n")); err != nil {
 		log.Printf("sendCommand(%q): %s", cmd, err)
 		return "", err
@@ -428,4 +429,38 @@ func (d *Dev) sendCommand(cmd string) (string, error) {
 	}
 	log.Printf("sendCommand(%q): %q", cmd, line)
 	return line, nil
+}
+
+func parseDistance(s string) (physic.Distance, error) {
+	// It seems the printer handlers this as a float but handle as integer here.
+	neg := s[0] == '-'
+	if neg {
+		s = s[1:]
+	}
+	var out physic.Distance
+	if i := strings.IndexRune(s, '.'); i != -1 {
+		v, err := strconv.Atoi(s[:i])
+		if err != nil {
+			return 0, err
+		}
+		f, err := strconv.Atoi(s[i+1:])
+		if err != nil {
+			return 0, err
+		}
+		ff := physic.MilliMetre
+		for j := 0; j < len(s[i+1:]); j++ {
+			ff /= 10
+		}
+		out = physic.MilliMetre*physic.Distance(v) + ff*physic.Distance(f)
+	} else {
+		v, err := strconv.Atoi(s)
+		if err != nil {
+			return 0, err
+		}
+		out = physic.MilliMetre * physic.Distance(v)
+	}
+	if neg {
+		out *= -1
+	}
+	return out, nil
 }

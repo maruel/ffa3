@@ -23,12 +23,39 @@ func play(d *ffa3.Dev) error {
 	if err := d.QueryPrinterInfo(&i); err != nil {
 		return err
 	}
-	fmt.Printf("Printer info: %# v\n", &i)
+	fmt.Printf("Printer info: %# v\n", i)
+
 	p := ffa3.Position{}
-	if err := d.QueryPosition(&p); err != nil {
+	if err := d.QueryExtruderPosition(&p); err != nil {
 		return err
 	}
-	fmt.Printf("Extruder position: %# v\n", &p)
+	fmt.Printf("Extruder position: %# v\n", p)
+
+	s := ffa3.Status{}
+	if err := d.QueryStatus(&s); err != nil {
+		return err
+	}
+	fmt.Printf("Status: %# v\n", s)
+
+	t := ffa3.Temperatures{}
+	if err := d.QueryTemp(&t); err != nil {
+		return err
+	}
+	fmt.Printf("Temperatures: %# v\n", t)
+
+	j, err := d.QueryJobStatus()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Job: %s\n", j)
+
+	if err := d.StopJob(); err != nil {
+		return err
+	}
+
+	resp, err := d.SendRawCommand("G28")
+	fmt.Printf("Response: %q\n", resp)
+	fmt.Printf("Err: %v\n", err)
 
 	/*
 		fmt.Printf("LED off\n")
