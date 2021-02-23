@@ -29,7 +29,7 @@ func mainImpl() error {
 	}
 
 	if *ip == "" {
-		f, err := ffa3.SearchNoListen()
+		f, err := ffa3.Search()
 		if err != nil {
 			return err
 		}

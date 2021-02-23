@@ -6,8 +6,8 @@
 package ffa3
 
 import (
+	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -78,7 +78,7 @@ func (f *Found) String() string {
 // Search searches for printers via UDP discovery.
 //
 // It does so by sending bytes to a predetermined multicast IP address.
-func SearchListenMulticast() ([]Found, error) {
+func Search() ([]Found, error) {
 	// Magic multicast IP the FlashForge Adventurer 3 is listening to.
 	const ip = "225.0.0.9:19000"
 	raddr, err := net.ResolveUDPAddr("udp4", ip)
@@ -86,26 +86,17 @@ func SearchListenMulticast() ([]Found, error) {
 		return nil, fmt.Errorf("failed to resolve %s: %w", ip, err)
 	}
 
-	// The easiest to get the right UDP port to listen to multicast network is to
-	// "dial" in UDP.
-	conn, err := net.DialUDP("udp4", nil, raddr)
-	if err != nil {
-		return nil, err
-	}
-	laddr := conn.LocalAddr().(*net.UDPAddr)
-	// Find a new port to listen to.
-	laddr, err = net.ResolveUDPAddr("udp4", laddr.IP.String()+":0")
-	if err != nil {
-		return nil, err
-	}
-	laddr1 := conn.LocalAddr().(*net.UDPAddr)
-
-	l, err := net.ListenMulticastUDP("udp4", nil, laddr)
+	// In practice we'd want to specify the right IP here, because otherwise
+	// laddr is set to 0.0.0.0. In practice it seems to work anyway.
+	// May want to revisit later.
+	l, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed listening to UDP: %w", err)
 	}
 	// Update the local address to get the port the listener is bound to.
-	b := [8192]byte{}
+	laddr := l.LocalAddr().(*net.UDPAddr)
+	log.Printf("Listening on: %s", laddr)
+	b := [1024]byte{}
 	l.SetReadBuffer(len(b))
 	var out []Found
 	wg := sync.WaitGroup{}
@@ -119,153 +110,29 @@ func SearchListenMulticast() ([]Found, error) {
 				// Ignore read errors since it'll fail when the connection is closed.
 				break
 			}
-			//name := string(b[:n])
-			name := hex.EncodeToString(b[:n])
-			out = append(out, Found{IP: src, Name: name})
+			// TODO(maruel): It's a 140 bytes packet. Figure out the format.
+			if i := bytes.IndexByte(b[:n], 0); i != -1 {
+				out = append(out, Found{IP: src, Name: string(b[:i])})
+			}
 		}
 	}()
 
-	laddr2 := l.LocalAddr().(*net.UDPAddr)
-	log.Printf("Listening on: %s:%d", laddr1.IP, laddr2.Port)
+	// It seems that the content is ignored in practice, and that the printer
+	// replies to the UDP packet origin IP:port anyway.
 	magic := [8]byte{}
-	copy(magic[:4], laddr1.IP)
-	binary.LittleEndian.PutUint32(magic[4:], uint32(laddr2.Port))
-	//copy(magic[:4], laddr.IP)
-	//binary.LittleEndian.PutUint32(magic[4:], uint32(laddr.Port))
+	copy(magic[:4], laddr.IP)
+	binary.BigEndian.PutUint16(magic[4:], uint16(laddr.Port))
 	log.Printf("Magic: %x", magic)
-	if _, err := conn.Write(magic[:]); err != nil {
-		log.Printf("err: %s", err)
-		conn.Close()
+	if _, err := l.WriteTo(magic[:], raddr); err != nil {
 		l.Close()
 		wg.Wait()
 		return nil, fmt.Errorf("failed to write magic packet: %w", err)
 	}
 
-	time.Sleep(time.Second)
-	err = conn.Close()
-	l.Close()
+	time.Sleep(100*time.Millisecond)
+	err = l.Close()
 	wg.Wait()
 	return out, err
-}
-
-// Search searches for printers via UDP discovery.
-//
-// It does so by sending bytes to a predetermined multicast IP address.
-func SearchListen() ([]Found, error) {
-	// Magic multicast IP the FlashForge Adventurer 3 is listening to.
-	const ip = "225.0.0.9:19000"
-	raddr, err := net.ResolveUDPAddr("udp4", ip)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve %s: %w", ip, err)
-	}
-
-	// The easiest to get the right UDP port to listen to multicast network is to
-	// "dial" in UDP.
-	conn, err := net.DialUDP("udp4", nil, raddr)
-	if err != nil {
-		return nil, err
-	}
-	laddr := conn.LocalAddr().(*net.UDPAddr)
-	// Find a new port to listen to.
-	laddr, err = net.ResolveUDPAddr("udp4", laddr.IP.String()+":0")
-	if err != nil {
-		return nil, err
-	}
-
-	l, err := net.ListenUDP("udp4", laddr)
-	if err != nil {
-		return nil, fmt.Errorf("failed listening to UDP: %w", err)
-	}
-	// Update the local address to get the port the listener is bound to.
-	laddr = l.LocalAddr().(*net.UDPAddr)
-	log.Printf("Listening on: %s", laddr)
-	b := [8192]byte{}
-	l.SetReadBuffer(len(b))
-	var out []Found
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			n, src, err := l.ReadFromUDP(b[:])
-			log.Printf("ReadFromUDP() = %v, %v, %v", n, src, err)
-			if err != nil {
-				// Ignore read errors since it'll fail when the connection is closed.
-				break
-			}
-			out = append(out, Found{IP: src, Name: string(b[:n])})
-		}
-	}()
-
-	magic := [8]byte{}
-	copy(magic[:4], laddr.IP)
-	binary.LittleEndian.PutUint32(magic[4:], uint32(laddr.Port))
-	log.Printf("Magic: %x", magic)
-	if _, err := conn.Write(magic[:]); err != nil {
-		log.Printf("err: %s", err)
-		conn.Close()
-		wg.Wait()
-		return nil, fmt.Errorf("failed to write magic packet: %w", err)
-	}
-
-	time.Sleep(time.Second)
-	err = conn.Close()
-	wg.Wait()
-	return out, err
-}
-
-// Search searches for printers via UDP discovery.
-//
-// It does so by sending bytes to a predetermined multicast IP address.
-func SearchNoListen() ([]Found, error) {
-	// Magic multicast IP the FlashForge Adventurer 3 is listening to.
-	const ip = "225.0.0.9:19000"
-	raddr, err := net.ResolveUDPAddr("udp4", ip)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve %s: %w", ip, err)
-	}
-
-	// The easiest to get the right UDP port to listen to multicast network is to
-	// "dial" in UDP.
-	conn, err := net.DialUDP("udp4", nil, raddr)
-	if err != nil {
-		return nil, err
-	}
-	laddr := conn.LocalAddr().(*net.UDPAddr)
-	log.Printf("Listening on: %v", laddr)
-	b := [8192]byte{}
-	conn.SetReadBuffer(len(b))
-	var out []Found
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			n, src, err := conn.ReadFromUDP(b[:])
-			log.Printf("ReadFromUDP() = %v, %v, %v", n, src, err)
-			if err != nil {
-				// Ignore read errors since it'll fail when the connection is closed.
-				break
-			}
-			out = append(out, Found{IP: src, Name: string(b[:n])})
-		}
-	}()
-
-	magic := [8]byte{}
-	copy(magic[:4], laddr.IP)
-	binary.LittleEndian.PutUint32(magic[4:], uint32(laddr.Port))
-	log.Printf("Magic: %x", magic)
-	if _, err := conn.Write(magic[:]); err != nil {
-		log.Printf("err: %s", err)
-		conn.Close()
-		wg.Wait()
-		return nil, fmt.Errorf("failed to write magic packet: %w", err)
-	}
-
-	time.Sleep(time.Second)
-	conn.Close()
-	wg.Wait()
-	return out, nil
 }
 
 // Dev represents a FlashForge Adventurer 3 printer on the network.
